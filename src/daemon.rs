@@ -525,9 +525,6 @@ impl State {
             self.app.ui(ctx);
         });
 
-        // Handle any app-level actions produced during the frame
-        self.handle_app_output();
-
         // Encode and submit
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
@@ -569,6 +566,9 @@ impl State {
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
         self.wl_surface.commit();
+
+        // Handle app actions after presenting so Hide doesn't skip the final frame
+        self.handle_app_output();
 
         // Request next frame callback (drives vsync)
         self.wl_surface.frame(qh, ());
