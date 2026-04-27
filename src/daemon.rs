@@ -630,6 +630,40 @@ smithay_client_toolkit::delegate_pointer!(State);
 smithay_client_toolkit::delegate_layer!(State);
 smithay_client_toolkit::delegate_registry!(State);
 
+pub fn run_daemon() {
+    let mut event_loop: EventLoop<'static, State> = EventLoop::try_new().expect("event loop");
+    let loop_handle = event_loop.handle();
+
+    let conn = Connection::connect_to_env().expect("Failed to connect to Wayland");
+    let (globals, event_queue) = registry_queue_init(&conn).expect("Failed to get Wayland globals");
+    let qh = event_queue.handle();
+
+    WaylandSource::new(conn.clone(), event_queue)
+        .insert(loop_handle.clone())
+        .expect("Failed to insert Wayland source");
+
+    let mut state = State::init(loop_handle.clone(), qh, conn, globals);
+
+    State::setup_socket(&loop_handle);
+
+    event_loop.run(None, &mut state, |state| {
+        if state.pending_toggle {
+            state.pending_toggle = false;
+            if state.app.visible {
+                state.hide();
+            } else {
+                let qh = state.qh.clone();
+                state.show(&qh);
+            }
+        }
+
+        if state.needs_redraw && state.app.visible {
+            let qh = state.qh.clone();
+            state.render_frame(&qh);
+        }
+    }).expect("Event loop error");
+}
+
 impl State {
     pub fn setup_socket(loop_handle: &LoopHandle<'static, Self>) {
         let _ = std::fs::remove_file(SOCKET_PATH);
