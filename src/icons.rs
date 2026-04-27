@@ -74,9 +74,9 @@ pub struct IconLoadResult {
 }
 
 pub struct IconResolver {
-    pub pending: std::collections::HashSet<String>,
-    pub tx: Sender<IconLoadResult>,
-    pub rx: Receiver<IconLoadResult>,
+    pending: std::collections::HashSet<String>,
+    tx: Sender<IconLoadResult>,
+    rx: Receiver<IconLoadResult>,
 }
 
 impl IconResolver {
@@ -99,6 +99,14 @@ impl IconResolver {
             }
         });
     }
+
+    pub fn poll(&mut self) -> Option<IconLoadResult> {
+        self.rx.try_recv().ok()
+    }
+}
+
+impl Default for IconResolver {
+    fn default() -> Self { Self::new() }
 }
 
 pub fn load_image_file(path: &std::path::Path) -> Option<(Vec<u8>, u32, u32)> {
@@ -130,19 +138,19 @@ fn resolve_to_rgba(project_path: &str) -> Option<(Vec<u8>, u32, u32)> {
     match detect_icon_kind(project_path) {
         IconKind::ImageFile(p) => load_image_file(&p),
         IconKind::BundledSvg(svg) => rasterize_svg(svg, 20),
-        IconKind::Folder => rasterize_svg(crate::assets::FOLDER_SVG, 20),
+        IconKind::Folder => rasterize_svg(assets::FOLDER_SVG, 20),
     }
 }
 
-/// Pre-rasterize all bundled SVGs at startup. Returns map from SVG pointer → RGBA data.
-pub fn rasterize_all_bundled() -> HashMap<*const u8, (Vec<u8>, u32, u32)> {
+/// Pre-rasterize all bundled SVGs at startup. Returns map from SVG pointer (as usize) → RGBA data.
+pub fn rasterize_all_bundled() -> HashMap<usize, (Vec<u8>, u32, u32)> {
     let all: &[&[u8]] = &[
-        crate::assets::RUST_SVG, crate::assets::JAVASCRIPT_SVG, crate::assets::TYPESCRIPT_SVG,
-        crate::assets::PYTHON_SVG, crate::assets::GO_SVG, crate::assets::RUBY_SVG,
-        crate::assets::JAVA_SVG, crate::assets::CPP_SVG, crate::assets::FOLDER_SVG,
+        assets::RUST_SVG, assets::JAVASCRIPT_SVG, assets::TYPESCRIPT_SVG,
+        assets::PYTHON_SVG, assets::GO_SVG, assets::RUBY_SVG,
+        assets::JAVA_SVG, assets::CPP_SVG, assets::FOLDER_SVG,
     ];
     all.iter()
-        .filter_map(|svg| rasterize_svg(svg, 20).map(|r| (svg.as_ptr(), r)))
+        .filter_map(|svg| rasterize_svg(svg, 20).map(|r| (svg.as_ptr() as usize, r)))
         .collect()
 }
 
@@ -191,5 +199,39 @@ mod tests {
         assert_eq!(w, 20);
         assert_eq!(h, 20);
         assert_eq!(bytes.len() as u32, w * h * 4); // RGBA
+    }
+
+    #[test]
+    fn test_rasterize_all_bundled_returns_nine_entries() {
+        let map = rasterize_all_bundled();
+        assert_eq!(map.len(), 9);
+        for (_, (bytes, w, h)) in &map {
+            assert_eq!(*w, 20);
+            assert_eq!(*h, 20);
+            assert_eq!(bytes.len() as u32, w * h * 4);
+        }
+    }
+
+    #[test]
+    fn test_load_image_file_png() {
+        let (bytes, w, h) = load_image_file(std::path::Path::new("tests/fixtures/1x1.png")).unwrap();
+        assert_eq!(w, 1);
+        assert_eq!(h, 1);
+        assert_eq!(bytes.len(), 4); // 1x1 RGBA
+    }
+
+    #[test]
+    fn test_icon_resolver_request_resolves_async() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), b"[package]").unwrap();
+        let mut resolver = IconResolver::new();
+        resolver.request(dir.path().to_str().unwrap());
+        // Give background thread time to complete
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let result = resolver.poll();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.width, 20);
+        assert_eq!(r.height, 20);
     }
 }
