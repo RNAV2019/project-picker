@@ -29,6 +29,11 @@ use smithay_client_toolkit::{
     },
 };
 use std::os::unix::net::UnixListener;
+use calloop::generic::Generic;
+use calloop::Interest;
+use std::io::Read;
+
+const SOCKET_PATH: &str = "/tmp/project-picker.sock";
 
 struct WaylandSurfaceHandle {
     surface: *mut std::ffi::c_void,  // wl_surface raw pointer
@@ -624,3 +629,34 @@ smithay_client_toolkit::delegate_keyboard!(State);
 smithay_client_toolkit::delegate_pointer!(State);
 smithay_client_toolkit::delegate_layer!(State);
 smithay_client_toolkit::delegate_registry!(State);
+
+impl State {
+    pub fn setup_socket(loop_handle: &LoopHandle<'static, Self>) {
+        let _ = std::fs::remove_file(SOCKET_PATH);
+        let listener = UnixListener::bind(SOCKET_PATH).expect("Failed to bind Unix socket");
+        listener.set_nonblocking(true).unwrap();
+
+        let source = Generic::new(listener, Interest::READ, calloop::Mode::Level);
+        loop_handle.insert_source(source, |_, listener, state| {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = String::new();
+                    let _ = stream.read_to_string(&mut buf);
+                    for line in buf.lines() {
+                        state.handle_ipc_command(line.trim());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => eprintln!("Socket accept error: {}", e),
+            }
+            Ok(calloop::PostAction::Continue)
+        }).expect("Failed to insert socket source");
+    }
+
+    fn handle_ipc_command(&mut self, cmd: &str) {
+        match cmd {
+            "toggle" => { self.pending_toggle = true; }
+            _ => {}
+        }
+    }
+}
