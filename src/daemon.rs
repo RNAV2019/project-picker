@@ -12,7 +12,7 @@ use smithay_client_toolkit::{
         calloop_wayland_source::WaylandSource,
         client::{
             globals::registry_queue_init,
-            protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
+            protocol::{wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
             Connection, Proxy, QueueHandle,
         },
     },
@@ -486,6 +486,134 @@ fn wayland_button_to_egui(button: u32) -> egui::PointerButton {
         0x111 => egui::PointerButton::Secondary,
         0x112 => egui::PointerButton::Middle,
         _ => egui::PointerButton::Primary,
+    }
+}
+
+impl State {
+    pub fn render_frame(&mut self, qh: &QueueHandle<Self>) {
+        if !self.configured || !self.app.visible {
+            return;
+        }
+
+        let surface_texture = match self.wgpu_surface.get_current_texture() {
+            Ok(t) => t,
+            Err(wgpu::SurfaceError::Lost) => {
+                self.wgpu_surface.configure(&self.device, &self.surface_config);
+                return;
+            }
+            Err(_) => return,
+        };
+
+        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [width, height],
+            pixels_per_point: 1.0,
+        };
+
+        // Collect pending input, clear for next frame
+        let mut raw_input = std::mem::take(&mut self.pending_input);
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width as f32, height as f32),
+        ));
+
+        // Build and process egui frame
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            self.app.ui(ctx);
+        });
+
+        // Handle any app-level actions produced during the frame
+        self.handle_app_output();
+
+        // Encode and submit
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        // Upload texture deltas
+        for (id, delta) in &full_output.textures_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+        }
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        let primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        self.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, &primitives, &screen_descriptor);
+
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0x1c as f64 / 255.0,
+                            g: 0x1c as f64 / 255.0,
+                            b: 0x1c as f64 / 255.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            // egui-wgpu 0.29 requires RenderPass<'static>; forget_lifetime() erases the
+            // encoder borrow (safe here because we do not use encoder after this block).
+            let mut render_pass = render_pass.forget_lifetime();
+            self.egui_renderer.render(&mut render_pass, &primitives, &screen_descriptor);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        surface_texture.present();
+        self.wl_surface.commit();
+
+        // Request next frame callback (drives vsync)
+        self.wl_surface.frame(qh, ());
+        self.needs_redraw = false;
+    }
+
+    pub fn show(&mut self, qh: &QueueHandle<Self>) {
+        self.layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        self.wl_surface.commit();
+        self.app.on_show();
+        self.wl_surface.frame(qh, ()); // kick off render loop
+        self.needs_redraw = true;
+    }
+
+    pub fn hide(&mut self) {
+        self.layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+        self.wl_surface.commit();
+        self.app.on_hide();
+    }
+
+    fn handle_app_output(&mut self) {
+        let actions = self.app.drain_actions();
+        for action in actions {
+            match action {
+                crate::app::AppAction::Hide => self.hide(),
+                crate::app::AppAction::OpenTerminal(path) => crate::terminal::open_terminal(&path),
+                crate::app::AppAction::RemoveProject(_) => {}
+            }
+        }
+    }
+}
+
+// Dispatch wl_callback (frame timing)
+impl smithay_client_toolkit::reexports::client::Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.needs_redraw = true;
+        }
     }
 }
 
