@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::collections::HashMap;
 use crate::assets;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +64,86 @@ pub fn rasterize_svg(svg_bytes: &[u8], size: u32) -> Option<(Vec<u8>, u32, u32)>
     let transform = tiny_skia::Transform::from_scale(scale, scale);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     Some((pixmap.data().to_vec(), size, size))
+}
+
+pub struct IconLoadResult {
+    pub project_path: String,
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub struct IconResolver {
+    pub pending: std::collections::HashSet<String>,
+    pub tx: Sender<IconLoadResult>,
+    pub rx: Receiver<IconLoadResult>,
+}
+
+impl IconResolver {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { pending: Default::default(), tx, rx }
+    }
+
+    pub fn request(&mut self, project_path: &str) {
+        if self.pending.contains(project_path) {
+            return;
+        }
+        self.pending.insert(project_path.to_string());
+        let path = project_path.to_string();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let rgba = resolve_to_rgba(&path);
+            if let Some((rgba, width, height)) = rgba {
+                let _ = tx.send(IconLoadResult { project_path: path, rgba, width, height });
+            }
+        });
+    }
+}
+
+pub fn load_image_file(path: &std::path::Path) -> Option<(Vec<u8>, u32, u32)> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if ext == "svg" {
+        let bytes = std::fs::read(path).ok()?;
+        return rasterize_svg(&bytes, 20);
+    }
+    if ext == "ico" {
+        return load_ico_closest_to(path, 20);
+    }
+    let img = image::open(path).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    Some((img.into_raw(), w, h))
+}
+
+fn load_ico_closest_to(path: &std::path::Path, target: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let file = std::fs::File::open(path).ok()?;
+    let dir = ico::IconDir::read(std::io::BufReader::new(file)).ok()?;
+    let entry = dir.entries().iter()
+        .min_by_key(|e| (e.width() as i32 - target as i32).unsigned_abs())?;
+    let image = entry.decode().ok()?;
+    let w = image.width();
+    let h = image.height();
+    Some((image.rgba_data().to_vec(), w, h))
+}
+
+fn resolve_to_rgba(project_path: &str) -> Option<(Vec<u8>, u32, u32)> {
+    match detect_icon_kind(project_path) {
+        IconKind::ImageFile(p) => load_image_file(&p),
+        IconKind::BundledSvg(svg) => rasterize_svg(svg, 20),
+        IconKind::Folder => rasterize_svg(crate::assets::FOLDER_SVG, 20),
+    }
+}
+
+/// Pre-rasterize all bundled SVGs at startup. Returns map from SVG pointer → RGBA data.
+pub fn rasterize_all_bundled() -> HashMap<*const u8, (Vec<u8>, u32, u32)> {
+    let all: &[&[u8]] = &[
+        crate::assets::RUST_SVG, crate::assets::JAVASCRIPT_SVG, crate::assets::TYPESCRIPT_SVG,
+        crate::assets::PYTHON_SVG, crate::assets::GO_SVG, crate::assets::RUBY_SVG,
+        crate::assets::JAVA_SVG, crate::assets::CPP_SVG, crate::assets::FOLDER_SVG,
+    ];
+    all.iter()
+        .filter_map(|svg| rasterize_svg(svg, 20).map(|r| (svg.as_ptr(), r)))
+        .collect()
 }
 
 #[cfg(test)]
