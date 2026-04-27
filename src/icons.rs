@@ -54,6 +54,16 @@ pub fn detect_icon_kind(project_path: &str) -> IconKind {
     IconKind::Folder
 }
 
+pub fn rasterize_svg(svg_bytes: &[u8], size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let options = usvg::Options::default();
+    let tree = usvg::Tree::from_data(svg_bytes, &options).ok()?;
+    let mut pixmap = tiny_skia::Pixmap::new(size, size)?;
+    let scale = size as f32 / tree.size().width().max(tree.size().height());
+    let transform = tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Some((pixmap.data().to_vec(), size, size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +101,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let kind = detect_icon_kind(dir.path().to_str().unwrap());
         assert_eq!(kind, IconKind::Folder);
+    }
+
+    #[test]
+    fn test_rasterize_bundled_svg() {
+        let (bytes, w, h) = rasterize_svg(crate::assets::FOLDER_SVG, 20).unwrap();
+        assert_eq!(w, 20);
+        assert_eq!(h, 20);
+        assert_eq!(bytes.len() as u32, w * h * 4); // RGBA
     }
 }
