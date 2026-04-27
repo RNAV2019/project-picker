@@ -1,3 +1,9 @@
+use raw_window_handle::{
+    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    WaylandDisplayHandle, WaylandWindowHandle,
+};
+use smithay_client_toolkit::reexports::client::globals::GlobalList;
+use std::ptr::NonNull;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     output::{OutputHandler, OutputState},
@@ -7,7 +13,7 @@ use smithay_client_toolkit::{
         client::{
             globals::registry_queue_init,
             protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
-            Connection, QueueHandle,
+            Connection, Proxy, QueueHandle,
         },
     },
     registry::{ProvidesRegistryState, RegistryState},
@@ -23,6 +29,28 @@ use smithay_client_toolkit::{
     },
 };
 use std::os::unix::net::UnixListener;
+
+struct WaylandSurfaceHandle {
+    surface: *mut std::ffi::c_void,  // wl_surface raw pointer
+    display: *mut std::ffi::c_void,  // wl_display raw pointer
+}
+
+unsafe impl Send for WaylandSurfaceHandle {}
+unsafe impl Sync for WaylandSurfaceHandle {}
+
+impl HasWindowHandle for WaylandSurfaceHandle {
+    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let handle = WaylandWindowHandle::new(NonNull::new(self.surface).unwrap());
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(RawWindowHandle::Wayland(handle)) })
+    }
+}
+
+impl HasDisplayHandle for WaylandSurfaceHandle {
+    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        let handle = WaylandDisplayHandle::new(NonNull::new(self.display).unwrap());
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(RawDisplayHandle::Wayland(handle)) })
+    }
+}
 
 pub struct State {
     // Wayland protocol state (SCK managed)
@@ -274,8 +302,117 @@ impl State {
         }
     }
 
-    fn resize_surface(&mut self, _width: u32, _height: u32, _qh: &QueueHandle<Self>) {
-        // Placeholder: will be implemented in the rendering task
+    fn resize_surface(&mut self, width: u32, height: u32, _qh: &QueueHandle<Self>) {
+        self.surface_config.width = width.max(1);
+        self.surface_config.height = height.max(1);
+        self.wgpu_surface.configure(&self.device, &self.surface_config);
+    }
+
+    /// Called from run_daemon after creating the EventLoop.
+    /// Returns the fully initialized State; does NOT create a new EventLoop.
+    pub fn init(
+        loop_handle: LoopHandle<'static, Self>,
+        qh: QueueHandle<Self>,
+        conn: Connection,
+        globals: GlobalList,
+    ) -> Self {
+        let compositor_state = CompositorState::bind(&globals, &qh)
+            .expect("wl_compositor not available");
+        let layer_shell = LayerShell::bind(&globals, &qh)
+            .expect("zwlr_layer_shell_v1 not available — is your compositor Hyprland/wlroots?");
+        let seat_state = SeatState::new(&globals, &qh);
+        let output_state = OutputState::new(&globals, &qh);
+        let registry_state = RegistryState::new(&globals);
+
+        // Create wl_surface and layer surface
+        let wl_surface = compositor_state.create_surface(&qh);
+        let layer_surface = layer_shell.create_layer_surface(
+            &qh, wl_surface.clone(), Layer::Overlay, Some("project-picker"), None,
+        );
+        layer_surface.set_anchor(smithay_client_toolkit::shell::wlr_layer::Anchor::TOP);
+        layer_surface.set_size(680, 0);
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+        wl_surface.commit();
+
+        // Build wgpu surface using the raw-window-handle bridge.
+        // The handle is leaked so it satisfies the 'static bound on wgpu::Surface<'static>.
+        let display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
+        let surface_ptr = wl_surface.id().as_ptr() as *mut std::ffi::c_void;
+        let handle: &'static WaylandSurfaceHandle = Box::leak(Box::new(
+            WaylandSurfaceHandle { surface: surface_ptr, display: display_ptr },
+        ));
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
+        let wgpu_surface = instance.create_surface(handle)
+            .expect("Failed to create wgpu surface");
+
+        let (adapter, device, queue) = pollster::block_on(async {
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: Some(&wgpu_surface),
+                    ..Default::default()
+                })
+                .await
+                .expect("No compatible GPU adapter");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default(), None)
+                .await
+                .expect("Failed to get device");
+            (adapter, device, queue)
+        });
+
+        let caps = wgpu_surface.get_capabilities(&adapter);
+        let format = caps.formats[0];
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: 680,
+            height: 480,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        wgpu_surface.configure(&device, &surface_config);
+
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let egui_ctx = egui::Context::default();
+
+        // Apply dark theme
+        let mut visuals = egui::Visuals::dark();
+        visuals.window_fill = egui::Color32::from_rgb(0x1c, 0x1c, 0x1c);
+        egui_ctx.set_visuals(visuals);
+
+        let app = crate::app::App::new();
+
+        State {
+            registry_state,
+            seat_state,
+            output_state,
+            compositor_state,
+            layer_shell,
+            layer_surface,
+            wl_surface,
+            device,
+            queue,
+            wgpu_surface,
+            surface_config,
+            egui_renderer,
+            egui_ctx,
+            pending_input: egui::RawInput::default(),
+            current_modifiers: egui::Modifiers::default(),
+            pointer_pos: egui::Pos2::ZERO,
+            app,
+            needs_redraw: false,
+            configured: false,
+            pending_toggle: false,
+            loop_handle,
+            qh,
+        }
     }
 }
 
