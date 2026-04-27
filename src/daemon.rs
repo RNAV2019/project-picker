@@ -65,6 +65,10 @@ pub struct State {
     compositor_state: CompositorState,
     layer_shell: LayerShell,
 
+    // Input devices (must be kept alive to receive events)
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+
     // Our layer surface
     layer_surface: LayerSurface,
     wl_surface: wl_surface::WlSurface,
@@ -200,13 +204,17 @@ impl SeatHandler for State {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Keyboard
-            && self.seat_state.get_keyboard(qh, &seat, None).is_ok()
-        {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(kb) => self.keyboard = Some(kb),
+                Err(e) => eprintln!("Failed to get keyboard: {e}"),
+            }
         }
-        if capability == Capability::Pointer
-            && self.seat_state.get_pointer(qh, &seat).is_ok()
-        {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(ptr) => self.pointer = Some(ptr),
+                Err(e) => eprintln!("Failed to get pointer: {e}"),
+            }
         }
     }
     fn remove_capability(
@@ -336,7 +344,7 @@ impl State {
             &qh, wl_surface.clone(), Layer::Overlay, Some("project-picker"), None,
         );
         layer_surface.set_anchor(smithay_client_toolkit::shell::wlr_layer::Anchor::TOP);
-        layer_surface.set_size(680, 0);
+        layer_surface.set_size(680, 480);
         layer_surface.set_exclusive_zone(-1);
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
         wl_surface.commit();
@@ -350,7 +358,7 @@ impl State {
         ));
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
+            backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
         let wgpu_surface = instance.create_surface(handle)
@@ -401,6 +409,8 @@ impl State {
             output_state,
             compositor_state,
             layer_shell,
+            keyboard: None,
+            pointer: None,
             layer_surface,
             wl_surface,
             device,
