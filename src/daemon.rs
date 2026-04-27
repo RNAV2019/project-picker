@@ -86,6 +86,7 @@ pub struct State {
     pending_toggle: bool,
     loop_handle: LoopHandle<'static, Self>,
     qh: QueueHandle<State>,
+    conn: Connection,
 }
 
 impl CompositorHandler for State {
@@ -412,6 +413,7 @@ impl State {
             pending_toggle: false,
             loop_handle,
             qh,
+            conn,
         }
     }
 }
