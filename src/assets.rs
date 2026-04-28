@@ -1,0 +1,9 @@
+pub const RUST_SVG: &[u8] = include_bytes!("assets/rust.svg");
+pub const JAVASCRIPT_SVG: &[u8] = include_bytes!("assets/javascript.svg");
+pub const TYPESCRIPT_SVG: &[u8] = include_bytes!("assets/typescript.svg");
+pub const PYTHON_SVG: &[u8] = include_bytes!("assets/python.svg");
+pub const GO_SVG: &[u8] = include_bytes!("assets/go.svg");
+pub const RUBY_SVG: &[u8] = include_bytes!("assets/ruby.svg");
+pub const JAVA_SVG: &[u8] = include_bytes!("assets/java.svg");
+pub const CPP_SVG: &[u8] = include_bytes!("assets/cpp.svg");
+pub const FOLDER_SVG: &[u8] = include_bytes!("assets/folder.svg");

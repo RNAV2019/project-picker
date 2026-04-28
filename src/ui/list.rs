@@ -1,0 +1,96 @@
+use egui::{Ui, Response, Color32, Rect, Vec2, Pos2};
+use crate::ui::theme;
+
+pub fn section_header(ui: &mut Ui, label: &str) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new(label.to_uppercase())
+                .size(theme::FONT_SECTION)
+                .color(theme::SECTION_HEADER),
+        );
+    });
+    ui.add_space(4.0);
+}
+
+/// Draws a clickable row background, returns response. `selected` highlights the row.
+fn row_background(ui: &mut Ui, height: f32, selected: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let bg = if selected {
+        theme::ROW_SELECTED
+    } else if response.hovered() {
+        theme::ROW_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 0.0, bg);
+    }
+    response
+}
+
+/// Returns true if clicked.
+pub fn action_row(ui: &mut Ui, icon: &str, label: &str, selected: bool) -> bool {
+    let response = row_background(ui, theme::ROW_H_ACTION, selected);
+    let mut child = ui.child_ui(response.rect, egui::Layout::left_to_right(egui::Align::Center), None);
+    child.add_space(16.0);
+    child.label(egui::RichText::new(icon).size(theme::ICON_SIZE).color(theme::TEXT_MUTED));
+    child.add_space(12.0);
+    child.label(egui::RichText::new(label).size(theme::FONT_TITLE).color(theme::TEXT_PRIMARY));
+    let right_ui_rect = Rect::from_min_size(
+        Pos2::new(response.rect.right() - 24.0, response.rect.top()),
+        Vec2::new(24.0, theme::ROW_H_ACTION),
+    );
+    let mut right_ui = ui.child_ui(right_ui_rect, egui::Layout::right_to_left(egui::Align::Center), None);
+    right_ui.label(egui::RichText::new("›").size(16.0).color(theme::TEXT_MUTED));
+    response.clicked()
+}
+
+/// Returns true if clicked. `icon_texture` is optional resolved icon.
+pub fn project_row(
+    ui: &mut Ui,
+    path: &str,
+    icon: Option<&egui::TextureHandle>,
+    selected: bool,
+) -> bool {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path);
+
+    let response = row_background(ui, theme::ROW_H_PROJECT, selected);
+    let mut child = ui.child_ui(response.rect, egui::Layout::left_to_right(egui::Align::Center), None);
+    child.add_space(16.0);
+
+    if let Some(tex) = icon {
+        child.image(egui::load::SizedTexture::new(tex.id(), [theme::ICON_SIZE, theme::ICON_SIZE]));
+    } else {
+        child.label(egui::RichText::new("📁").size(theme::ICON_SIZE));
+    }
+    child.add_space(12.0);
+
+    child.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(name).size(theme::FONT_TITLE).strong().color(theme::TEXT_PRIMARY),
+        );
+        ui.label(
+            egui::RichText::new(path).size(theme::FONT_SUBTITLE).color(theme::TEXT_MUTED),
+        );
+    });
+
+    response.clicked()
+}
+
+pub fn suggestion_row(ui: &mut Ui, path: &str, selected: bool) -> bool {
+    let response = row_background(ui, theme::ROW_H_ACTION, selected);
+    let mut child = ui.child_ui(response.rect, egui::Layout::left_to_right(egui::Align::Center), None);
+    child.add_space(16.0);
+    child.label(egui::RichText::new("📁").size(theme::ICON_SIZE).color(theme::TEXT_MUTED));
+    child.add_space(12.0);
+    child.label(egui::RichText::new(path).size(theme::FONT_TITLE).color(theme::TEXT_PRIMARY));
+    response.clicked()
+}
