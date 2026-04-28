@@ -30,6 +30,14 @@ project-picker --toggle  # show/hide the picker (starts daemon automatically if 
 
 ## Hyprland Setup
 
+**Autostart** — the daemon should be started with your Hyprland session. Add to `hyprland.conf`:
+
+```ini
+exec-once = project-picker
+```
+
+This starts the daemon in the background at login. The first `--toggle` keypress will show the picker instantly with no cold-start delay.
+
 **Key binding** — add to `hyprland.conf` or your keybinds config:
 
 ```ini
@@ -43,14 +51,6 @@ windowrule = match:class uk.co.ryannavsaria.project-picker, float on
 windowrule = match:class uk.co.ryannavsaria.project-picker, center on
 windowrule = match:class uk.co.ryannavsaria.project-picker, border_size 0
 windowrule = match:class uk.co.ryannavsaria.project-picker, rounding 18
-```
-
-Adjust `border_size` and `rounding` to taste. If you want a subtle border:
-
-```ini
-windowrule = match:class uk.co.ryannavsaria.project-picker, border_size 2
-windowrule = match:class uk.co.ryannavsaria.project-picker, rounding 18
-windowrule = border_color rgb(3a3a3a) rgb(2e2e2e), match:class uk.co.ryannavsaria.project-picker
 ```
 
 ## Keyboard Shortcuts
