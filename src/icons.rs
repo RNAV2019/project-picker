@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::collections::HashMap;
 use crate::assets;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,23 +141,22 @@ fn resolve_to_rgba(project_path: &str) -> Option<(Vec<u8>, u32, u32)> {
     }
 }
 
-/// Pre-rasterize all bundled SVGs at startup. Returns map from SVG pointer (as usize) → RGBA data.
-pub fn rasterize_all_bundled() -> HashMap<usize, (Vec<u8>, u32, u32)> {
-    let all: &[&[u8]] = &[
-        assets::RUST_SVG, assets::JAVASCRIPT_SVG, assets::TYPESCRIPT_SVG,
-        assets::PYTHON_SVG, assets::GO_SVG, assets::RUBY_SVG,
-        assets::JAVA_SVG, assets::CPP_SVG, assets::FOLDER_SVG,
-    ];
-    all.iter()
-        .filter_map(|svg| rasterize_svg(svg, 20).map(|r| (svg.as_ptr() as usize, r)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn rasterize_all_bundled() -> std::collections::HashMap<usize, (Vec<u8>, u32, u32)> {
+        let all: &[&[u8]] = &[
+            crate::assets::RUST_SVG, crate::assets::JAVASCRIPT_SVG, crate::assets::TYPESCRIPT_SVG,
+            crate::assets::PYTHON_SVG, crate::assets::GO_SVG, crate::assets::RUBY_SVG,
+            crate::assets::JAVA_SVG, crate::assets::CPP_SVG, crate::assets::FOLDER_SVG,
+        ];
+        all.iter()
+            .filter_map(|svg| rasterize_svg(svg, 20).map(|r| (svg.as_ptr() as usize, r)))
+            .collect()
+    }
 
     #[test]
     fn test_detects_rust_project() {
