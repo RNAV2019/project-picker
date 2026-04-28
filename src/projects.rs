@@ -50,6 +50,19 @@ pub fn save_recents(recents: &[String]) {
     save_recents_to(&recents_path(), recents);
 }
 
+pub fn pinned_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".config/project-picker/pinned.json")
+}
+
+pub fn load_pinned() -> Vec<String> {
+    load_recents_from(&pinned_path())
+}
+
+pub fn save_pinned(pinned: &[String]) {
+    save_recents_to(&pinned_path(), pinned);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

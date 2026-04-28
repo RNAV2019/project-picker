@@ -1,368 +1,96 @@
-use raw_window_handle::{
-    HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
-    WaylandDisplayHandle, WaylandWindowHandle,
-};
-use smithay_client_toolkit::reexports::client::globals::GlobalList;
-use std::ptr::NonNull;
-use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    output::{OutputHandler, OutputState},
-    reexports::{
-        calloop::{EventLoop, LoopHandle},
-        calloop_wayland_source::WaylandSource,
-        client::{
-            globals::registry_queue_init,
-            protocol::{wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
-            Connection, Proxy, QueueHandle,
-        },
-    },
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-    seat::{
-        keyboard::{KeyEvent, KeyboardHandler, Modifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
-        Capability, SeatHandler, SeatState,
-    },
-    shell::wlr_layer::{
-        KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-        LayerSurfaceConfigure,
-    },
-};
 use std::os::unix::net::UnixListener;
-use calloop::generic::Generic;
-use calloop::Interest;
-use std::io::Read;
+use std::sync::Arc;
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event::{StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::platform::wayland::WindowAttributesExtWayland;
+use winit::window::{Window, WindowAttributes, WindowId};
 
 const SOCKET_PATH: &str = "/tmp/project-picker.sock";
+const LOGICAL_WIDTH: f64 = 680.0;
+const LOGICAL_HEIGHT: f64 = 480.0;
 
-struct WaylandSurfaceHandle {
-    surface: *mut std::ffi::c_void,  // wl_surface raw pointer
-    display: *mut std::ffi::c_void,  // wl_display raw pointer
+#[derive(Debug)]
+enum UserEvent {
+    Toggle,
 }
 
-unsafe impl Send for WaylandSurfaceHandle {}
-unsafe impl Sync for WaylandSurfaceHandle {}
-
-impl HasWindowHandle for WaylandSurfaceHandle {
-    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        let handle = WaylandWindowHandle::new(NonNull::new(self.surface).unwrap());
-        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(RawWindowHandle::Wayland(handle)) })
-    }
-}
-
-impl HasDisplayHandle for WaylandSurfaceHandle {
-    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        let handle = WaylandDisplayHandle::new(NonNull::new(self.display).unwrap());
-        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(RawDisplayHandle::Wayland(handle)) })
-    }
-}
-
-pub struct State {
-    // Wayland protocol state (SCK managed)
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
-    compositor_state: CompositorState,
-    layer_shell: LayerShell,
-
-    // Input devices (must be kept alive to receive events)
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
-
-    // Our layer surface
-    layer_surface: LayerSurface,
-    wl_surface: wl_surface::WlSurface,
-
-    // wgpu rendering
+/// GPU resources that survive hide/show cycles.
+struct GpuState {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    egui_renderer: egui_wgpu::Renderer,
+    surface_format: wgpu::TextureFormat,
+}
+
+/// Per-window state created on show, destroyed on hide.
+///
+/// `wgpu_surface` MUST be declared before `window` so it is dropped first —
+/// wgpu holds its own Arc<Window> reference internally and must release it
+/// before we drop our Arc here, allowing the Wayland wl_surface to be destroyed.
+struct WindowState {
     wgpu_surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
-    egui_renderer: egui_wgpu::Renderer,
+    window: Arc<Window>,
+    egui_state: egui_winit::State,
+}
 
-    // egui
+struct State {
+    gpu: GpuState,
+    win: Option<WindowState>,
     egui_ctx: egui::Context,
-    pending_input: egui::RawInput,
-    current_modifiers: egui::Modifiers,
-    pointer_pos: egui::Pos2,
-
-    // App logic
     app: crate::app::App,
-
-    // Control
-    needs_redraw: bool,
-    configured: bool,
-    pending_toggle: bool,
-    loop_handle: LoopHandle<'static, Self>,
-    qh: QueueHandle<State>,
-    conn: Connection,
-}
-
-impl CompositorHandler for State {
-    fn scale_factor_changed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
-    ) {
-    }
-    fn transform_changed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_transform: wl_output::Transform,
-    ) {
-    }
-    fn frame(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _time: u32,
-    ) {
-        self.needs_redraw = true;
-    }
-}
-
-impl OutputHandler for State {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
-    }
-    fn new_output(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
-    fn update_output(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
-    fn output_destroyed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _output: wl_output::WlOutput,
-    ) {
-    }
-}
-
-impl LayerShellHandler for State {
-    fn closed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-    ) {
-        std::process::exit(0);
-    }
-    fn configure(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-        configure: LayerSurfaceConfigure,
-        _serial: u32,
-    ) {
-        let (width, height) = configure.new_size;
-        let width = if width == 0 { 680 } else { width };
-        let height = if height == 0 { 40 } else { height };
-        self.resize_surface(width, height, qh);
-        self.configured = true;
-        self.needs_redraw = true;
-    }
-}
-
-impl ProvidesRegistryState for State {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    registry_handlers![OutputState, SeatState];
-}
-
-impl SeatHandler for State {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
-    }
-    fn new_seat(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
-    ) {
-    }
-    fn new_capability(
-        &mut self,
-        _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        seat: wl_seat::WlSeat,
-        capability: Capability,
-    ) {
-        if capability == Capability::Keyboard && self.keyboard.is_none() {
-            match self.seat_state.get_keyboard(qh, &seat, None) {
-                Ok(kb) => self.keyboard = Some(kb),
-                Err(e) => eprintln!("Failed to get keyboard: {e}"),
-            }
-        }
-        if capability == Capability::Pointer && self.pointer.is_none() {
-            match self.seat_state.get_pointer(qh, &seat) {
-                Ok(ptr) => self.pointer = Some(ptr),
-                Err(e) => eprintln!("Failed to get pointer: {e}"),
-            }
-        }
-    }
-    fn remove_capability(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
-        _capability: Capability,
-    ) {
-    }
-    fn remove_seat(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
-    ) {
-    }
-}
-
-impl KeyboardHandler for State {
-    fn enter(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _surface: &wl_surface::WlSurface,
-        _serial: u32,
-        _raw: &[u32],
-        _keysyms: &[smithay_client_toolkit::seat::keyboard::Keysym],
-    ) {
-    }
-    fn leave(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _surface: &wl_surface::WlSurface,
-        _serial: u32,
-    ) {
-    }
-    fn press_key(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        event: KeyEvent,
-    ) {
-        self.handle_key(event, true);
-        self.needs_redraw = true;
-    }
-    fn release_key(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        event: KeyEvent,
-    ) {
-        self.handle_key(event, false);
-    }
-    fn update_modifiers(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _keyboard: &wl_keyboard::WlKeyboard,
-        _serial: u32,
-        modifiers: Modifiers,
-    ) {
-        self.current_modifiers = egui::Modifiers {
-            alt: modifiers.alt,
-            ctrl: modifiers.ctrl,
-            shift: modifiers.shift,
-            mac_cmd: false,
-            command: modifiers.ctrl,
-        };
-    }
 }
 
 impl State {
-    fn handle_key(&mut self, event: KeyEvent, pressed: bool) {
-        // Push text event for printable chars on press only
-        if pressed {
-            if let Some(text) = &event.utf8 {
-                if !text.chars().all(|c| c.is_control()) {
-                    self.pending_input.events.push(egui::Event::Text(text.clone()));
-                }
-            }
-        }
-        // Push key event for navigational/special keys
-        if let Some(key) = keysym_to_egui(event.keysym) {
-            self.pending_input.events.push(egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed,
-                repeat: false,
-                modifiers: self.current_modifiers,
-            });
+    fn reconfigure_surface(&self) {
+        if let Some(win) = &self.win {
+            win.wgpu_surface.configure(&self.gpu.device, &win.surface_config);
         }
     }
 
-    fn resize_surface(&mut self, width: u32, height: u32, _qh: &QueueHandle<Self>) {
-        self.surface_config.width = width.max(1);
-        self.surface_config.height = height.max(1);
-        self.wgpu_surface.configure(&self.device, &self.surface_config);
+    fn request_redraw(&self) {
+        if let Some(win) = &self.win {
+            win.window.request_redraw();
+        }
+    }
+}
+
+struct Daemon {
+    state: Option<State>,
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+fn window_attrs() -> WindowAttributes {
+    WindowAttributes::default()
+        .with_title("Project Picker")
+        .with_name("uk.co.ryannavsaria.project-picker", "project-picker")
+        .with_inner_size(LogicalSize::new(LOGICAL_WIDTH, LOGICAL_HEIGHT))
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_transparent(true)
+}
+
+impl Daemon {
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        Daemon { state: None, proxy }
     }
 
-    /// Called from run_daemon after creating the EventLoop.
-    /// Returns the fully initialized State; does NOT create a new EventLoop.
-    pub fn init(
-        loop_handle: LoopHandle<'static, Self>,
-        qh: QueueHandle<Self>,
-        conn: Connection,
-        globals: GlobalList,
-    ) -> Self {
-        let compositor_state = CompositorState::bind(&globals, &qh)
-            .expect("wl_compositor not available");
-        let layer_shell = LayerShell::bind(&globals, &qh)
-            .expect("zwlr_layer_shell_v1 not available — is your compositor Hyprland/wlroots?");
-        let seat_state = SeatState::new(&globals, &qh);
-        let output_state = OutputState::new(&globals, &qh);
-        let registry_state = RegistryState::new(&globals);
-
-        // Create wl_surface and layer surface
-        let wl_surface = compositor_state.create_surface(&qh);
-        let layer_surface = layer_shell.create_layer_surface(
-            &qh, wl_surface.clone(), Layer::Overlay, Some("project-picker"), None,
-        );
-        layer_surface.set_anchor(smithay_client_toolkit::shell::wlr_layer::Anchor::TOP);
-        layer_surface.set_size(680, 480);
-        layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
-        wl_surface.commit();
-
-        // Build wgpu surface using the raw-window-handle bridge.
-        // The handle is leaked so it satisfies the 'static bound on wgpu::Surface<'static>.
-        let display_ptr = conn.backend().display_ptr() as *mut std::ffi::c_void;
-        let surface_ptr = wl_surface.id().as_ptr() as *mut std::ffi::c_void;
-        let handle: &'static WaylandSurfaceHandle = Box::leak(Box::new(
-            WaylandSurfaceHandle { surface: surface_ptr, display: display_ptr },
-        ));
+    /// Full init: create GPU + window together (needed so adapter is surface-compatible).
+    fn init_full(&mut self, event_loop: &ActiveEventLoop) {
+        let attrs = window_attrs();
+        let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
+        let scale = window.scale_factor();
+        let phys = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
-        let wgpu_surface = instance.create_surface(handle)
-            .expect("Failed to create wgpu surface");
+        let wgpu_surface = instance.create_surface(window.clone()).expect("Failed to create wgpu surface");
 
         let (adapter, device, queue) = pollster::block_on(async {
             let adapter = instance
@@ -381,178 +109,212 @@ impl State {
 
         let caps = wgpu_surface.get_capabilities(&adapter);
         let format = caps.formats[0];
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|&m| m == wgpu::CompositeAlphaMode::PreMultiplied)
+            .unwrap_or(wgpu::CompositeAlphaMode::Auto);
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: 680,
-            height: 480,
+            width: phys.width.max(1),
+            height: phys.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         wgpu_surface.configure(&device, &surface_config);
 
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
-        let egui_ctx = egui::Context::default();
 
-        // Apply dark theme
+        let egui_ctx = egui::Context::default();
         let mut visuals = egui::Visuals::dark();
-        visuals.window_fill = egui::Color32::from_rgb(0x1c, 0x1c, 0x1c);
+        visuals.window_fill = crate::ui::theme::BG;
         egui_ctx.set_visuals(visuals);
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        egui_ctx.set_fonts(fonts);
+
+        let max_texture_side = device.limits().max_texture_dimension_2d as usize;
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(scale as f32),
+            None,
+            Some(max_texture_side),
+        );
 
         let app = crate::app::App::new();
 
-        State {
-            registry_state,
-            seat_state,
-            output_state,
-            compositor_state,
-            layer_shell,
-            keyboard: None,
-            pointer: None,
-            layer_surface,
-            wl_surface,
-            device,
-            queue,
-            wgpu_surface,
-            surface_config,
-            egui_renderer,
+        self.state = Some(State {
+            gpu: GpuState { instance, adapter, device, queue, egui_renderer, surface_format: format },
+            win: Some(WindowState { wgpu_surface, surface_config, window, egui_state }),
             egui_ctx,
-            pending_input: egui::RawInput::default(),
-            current_modifiers: egui::Modifiers::default(),
-            pointer_pos: egui::Pos2::ZERO,
             app,
-            needs_redraw: false,
-            configured: false,
-            pending_toggle: false,
-            loop_handle,
-            qh,
-            conn,
+        });
+    }
+
+    /// Recreate only the window + surface using existing GPU state.
+    fn open_window(&mut self, event_loop: &ActiveEventLoop) {
+        let state = match self.state.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let attrs = window_attrs();
+        let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
+        let scale = window.scale_factor();
+        let phys = window.inner_size();
+
+        let wgpu_surface = state.gpu.instance
+            .create_surface(window.clone())
+            .expect("Failed to create wgpu surface");
+        let caps = wgpu_surface.get_capabilities(&state.gpu.adapter);
+
+        let format = caps.formats.iter().copied()
+            .find(|&f| f == state.gpu.surface_format)
+            .unwrap_or(caps.formats[0]);
+        if format != state.gpu.surface_format {
+            state.gpu.surface_format = format;
+            state.gpu.egui_renderer =
+                egui_wgpu::Renderer::new(&state.gpu.device, format, None, 1, false);
         }
-    }
-}
 
-fn keysym_to_egui(
-    sym: smithay_client_toolkit::seat::keyboard::Keysym,
-) -> Option<egui::Key> {
-    use smithay_client_toolkit::seat::keyboard::Keysym;
-    match sym {
-        Keysym::Up => Some(egui::Key::ArrowUp),
-        Keysym::Down => Some(egui::Key::ArrowDown),
-        Keysym::Left => Some(egui::Key::ArrowLeft),
-        Keysym::Right => Some(egui::Key::ArrowRight),
-        Keysym::Return | Keysym::KP_Enter => Some(egui::Key::Enter),
-        Keysym::Escape => Some(egui::Key::Escape),
-        Keysym::BackSpace => Some(egui::Key::Backspace),
-        Keysym::Tab => Some(egui::Key::Tab),
-        Keysym::ISO_Left_Tab => Some(egui::Key::Tab),
-        _ => None,
-    }
-}
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|&m| m == wgpu::CompositeAlphaMode::PreMultiplied)
+            .unwrap_or(wgpu::CompositeAlphaMode::Auto);
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: phys.width.max(1),
+            height: phys.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        wgpu_surface.configure(&state.gpu.device, &surface_config);
 
-impl PointerHandler for State {
-    fn pointer_frame(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
-        events: &[PointerEvent],
-    ) {
-        for event in events {
-            let pos = egui::pos2(event.position.0 as f32, event.position.1 as f32);
-            match event.kind {
-                PointerEventKind::Motion { .. } => {
-                    self.pointer_pos = pos;
-                    self.pending_input.events.push(egui::Event::PointerMoved(pos));
-                    self.needs_redraw = true;
-                }
-                PointerEventKind::Press { button, .. } => {
-                    let btn = wayland_button_to_egui(button);
-                    self.pending_input.events.push(egui::Event::PointerButton {
-                        pos,
-                        button: btn,
-                        pressed: true,
-                        modifiers: self.current_modifiers,
-                    });
-                    self.needs_redraw = true;
-                }
-                PointerEventKind::Release { button, .. } => {
-                    let btn = wayland_button_to_egui(button);
-                    self.pending_input.events.push(egui::Event::PointerButton {
-                        pos,
-                        button: btn,
-                        pressed: false,
-                        modifiers: self.current_modifiers,
-                    });
-                }
-                PointerEventKind::Leave { .. } => {
-                    self.pending_input.events.push(egui::Event::PointerGone);
-                }
-                _ => {}
+        let max_texture_side = state.gpu.device.limits().max_texture_dimension_2d as usize;
+        let egui_state = egui_winit::State::new(
+            state.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(scale as f32),
+            None,
+            Some(max_texture_side),
+        );
+
+        state.win = Some(WindowState { wgpu_surface, surface_config, window, egui_state });
+    }
+
+    fn toggle(&mut self, event_loop: &ActiveEventLoop) {
+        let showing = self.state.as_ref()
+            .map_or(false, |s| s.win.is_some() && s.app.anim_showing);
+        let hidden = self.state.as_ref().map_or(true, |s| s.win.is_none());
+
+        if showing {
+            let state = self.state.as_mut().unwrap();
+            state.app.begin_hide();
+            state.request_redraw();
+        } else if hidden {
+            if self.state.is_none() {
+                self.init_full(event_loop);
+            } else {
+                self.open_window(event_loop);
+            }
+            if let Some(state) = self.state.as_mut() {
+                state.app.on_show();
+                state.request_redraw();
             }
         }
+        // Mid-close-animation toggle: ignore (let animation complete)
     }
-}
 
-fn wayland_button_to_egui(button: u32) -> egui::PointerButton {
-    match button {
-        0x110 => egui::PointerButton::Primary,
-        0x111 => egui::PointerButton::Secondary,
-        0x112 => egui::PointerButton::Middle,
-        _ => egui::PointerButton::Primary,
-    }
-}
-
-impl State {
-    pub fn render_frame(&mut self, qh: &QueueHandle<Self>) {
-        if !self.configured || !self.app.visible {
+    fn render(&mut self) {
+        let state = match self.state.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if state.win.is_none() {
             return;
         }
 
-        let surface_texture = match self.wgpu_surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost) => {
-                self.wgpu_surface.configure(&self.device, &self.surface_config);
-                return;
+        let raw_input = {
+            let win = state.win.as_mut().unwrap();
+            win.egui_state.take_egui_input(&win.window)
+        };
+
+        let full_output = state.egui_ctx.run(raw_input, |ctx| {
+            state.app.ui(ctx);
+        });
+
+        {
+            let win = state.win.as_mut().unwrap();
+            win.egui_state.handle_platform_output(&win.window, full_output.platform_output);
+        }
+
+        for (id, delta) in &full_output.textures_delta.set {
+            state.gpu.egui_renderer.update_texture(&state.gpu.device, &state.gpu.queue, *id, delta);
+        }
+        for id in &full_output.textures_delta.free {
+            state.gpu.egui_renderer.free_texture(id);
+        }
+
+        // Animation complete: drop WindowState → wl_surface destroyed → compositor unmaps window.
+        // wgpu_surface is dropped before window (field declaration order) so wgpu releases its
+        // Arc<Window> ref first, then our Arc<Window> hits refcount 0 and the window is destroyed.
+        if state.app.anim_hide_pending {
+            state.app.anim_hide_pending = false;
+            state.app.on_hide();
+            state.win = None;
+            return;
+        }
+
+        let screen_descriptor = {
+            let win = state.win.as_ref().unwrap();
+            egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [win.surface_config.width, win.surface_config.height],
+                pixels_per_point: win.window.scale_factor() as f32,
             }
-            Err(_) => return,
+        };
+
+        let surface_texture = {
+            let win = state.win.as_mut().unwrap();
+            match win.wgpu_surface.get_current_texture() {
+                Ok(t) => t,
+                Err(wgpu::SurfaceError::Lost) => {
+                    win.wgpu_surface.configure(&state.gpu.device, &win.surface_config);
+                    return;
+                }
+                Err(wgpu::SurfaceError::OutOfMemory) => {
+                    eprintln!("wgpu: out of memory");
+                    return;
+                }
+                Err(_) => return,
+            }
         };
 
         let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let width = self.surface_config.width;
-        let height = self.surface_config.height;
 
-        let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [width, height],
-            pixels_per_point: 1.0,
-        };
+        let mut encoder = state.gpu.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor::default(),
+        );
 
-        // Collect pending input, clear for next frame
-        let mut raw_input = std::mem::take(&mut self.pending_input);
-        raw_input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(width as f32, height as f32),
-        ));
-
-        // Build and process egui frame
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            self.app.ui(ctx);
-        });
-
-        // Encode and submit
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-
-        // Upload texture deltas
-        for (id, delta) in &full_output.textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
-        }
-        for id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
-        }
-
-        let primitives = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-        self.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, &primitives, &screen_descriptor);
+        let primitives = state.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        state.gpu.egui_renderer.update_buffers(
+            &state.gpu.device,
+            &state.gpu.queue,
+            &mut encoder,
+            &primitives,
+            &screen_descriptor,
+        );
 
         {
             let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -562,145 +324,145 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0x1c as f64 / 255.0,
-                            g: 0x1c as f64 / 255.0,
-                            b: 0x1c as f64 / 255.0,
-                            a: 1.0,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 ..Default::default()
             });
-            // egui-wgpu 0.29 requires RenderPass<'static>; forget_lifetime() erases the
-            // encoder borrow (safe here because we do not use encoder after this block).
             let mut render_pass = render_pass.forget_lifetime();
-            self.egui_renderer.render(&mut render_pass, &primitives, &screen_descriptor);
+            state.gpu.egui_renderer.render(&mut render_pass, &primitives, &screen_descriptor);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        state.gpu.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
-        self.wl_surface.commit();
 
-        // Handle app actions after presenting so Hide doesn't skip the final frame
-        self.handle_app_output();
-
-        // Request next frame callback (drives vsync)
-        self.wl_surface.frame(qh, ());
-        self.needs_redraw = false;
-    }
-
-    pub fn show(&mut self, qh: &QueueHandle<Self>) {
-        self.layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        self.wl_surface.commit();
-        self.app.on_show();
-        self.wl_surface.frame(qh, ()); // kick off render loop
-        self.needs_redraw = true;
-    }
-
-    pub fn hide(&mut self) {
-        self.layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
-        self.wl_surface.commit();
-        self.app.on_hide();
-    }
-
-    fn handle_app_output(&mut self) {
-        let actions = self.app.drain_actions();
+        let actions = state.app.drain_actions();
         for action in actions {
             match action {
-                crate::app::AppAction::Hide => self.hide(),
+                crate::app::AppAction::Hide => {
+                    state.app.begin_hide();
+                    state.request_redraw();
+                }
                 crate::app::AppAction::OpenTerminal(path) => crate::terminal::open_terminal(&path),
-                crate::app::AppAction::RemoveProject(_) => {}
+            }
+        }
+
+        for (_id, viewport) in &full_output.viewport_output {
+            if viewport.repaint_delay.is_zero() {
+                state.request_redraw();
             }
         }
     }
 }
 
-// Dispatch wl_callback (frame timing)
-impl smithay_client_toolkit::reexports::client::Dispatch<wl_callback::WlCallback, ()> for State {
-    fn event(
-        state: &mut Self,
-        _proxy: &wl_callback::WlCallback,
-        event: wl_callback::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-        if let wl_callback::Event::Done { .. } = event {
-            state.needs_redraw = true;
-        }
+impl ApplicationHandler<UserEvent> for Daemon {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+        // Lazy init: GPU and window are created on first toggle-show.
     }
-}
 
-smithay_client_toolkit::delegate_compositor!(State);
-smithay_client_toolkit::delegate_output!(State);
-smithay_client_toolkit::delegate_seat!(State);
-smithay_client_toolkit::delegate_keyboard!(State);
-smithay_client_toolkit::delegate_pointer!(State);
-smithay_client_toolkit::delegate_layer!(State);
-smithay_client_toolkit::delegate_registry!(State);
-
-pub fn run_daemon() {
-    let mut event_loop: EventLoop<'static, State> = EventLoop::try_new().expect("event loop");
-    let loop_handle = event_loop.handle();
-
-    let conn = Connection::connect_to_env().expect("Failed to connect to Wayland");
-    let (globals, event_queue) = registry_queue_init(&conn).expect("Failed to get Wayland globals");
-    let qh = event_queue.handle();
-
-    WaylandSource::new(conn.clone(), event_queue)
-        .insert(loop_handle.clone())
-        .expect("Failed to insert Wayland source");
-
-    let mut state = State::init(loop_handle.clone(), qh, conn, globals);
-
-    State::setup_socket(&loop_handle);
-
-    event_loop.run(None, &mut state, |state| {
-        if state.pending_toggle {
-            state.pending_toggle = false;
-            if state.app.visible {
-                state.hide();
-            } else {
-                let qh = state.qh.clone();
-                state.show(&qh);
-            }
-        }
-
-        if state.needs_redraw && state.app.visible {
-            let qh = state.qh.clone();
-            state.render_frame(&qh);
-        }
-    }).expect("Event loop error");
-}
-
-impl State {
-    pub fn setup_socket(loop_handle: &LoopHandle<'static, Self>) {
-        let _ = std::fs::remove_file(SOCKET_PATH);
-        let listener = UnixListener::bind(SOCKET_PATH).expect("Failed to bind Unix socket");
-        listener.set_nonblocking(true).unwrap();
-
-        let source = Generic::new(listener, Interest::READ, calloop::Mode::Level);
-        loop_handle.insert_source(source, |_, listener, state| {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let mut buf = String::new();
-                    let _ = stream.read_to_string(&mut buf);
-                    for line in buf.lines() {
-                        state.handle_ipc_command(line.trim());
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::Init = cause {
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_file(SOCKET_PATH);
+                let listener = UnixListener::bind(SOCKET_PATH).expect("Failed to bind Unix socket");
+                for stream in listener.incoming() {
+                    if let Ok(mut stream) = stream {
+                        let mut buf = String::new();
+                        use std::io::Read;
+                        let _ = stream.read_to_string(&mut buf);
+                        for line in buf.lines() {
+                            if line.trim() == "toggle" {
+                                let _ = proxy.send_event(UserEvent::Toggle);
+                            }
+                        }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => eprintln!("Socket accept error: {}", e),
-            }
-            Ok(calloop::PostAction::Continue)
-        }).expect("Failed to insert socket source");
+            });
+        }
     }
 
-    fn handle_ipc_command(&mut self, cmd: &str) {
-        match cmd {
-            "toggle" => { self.pending_toggle = true; }
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Toggle => self.toggle(event_loop),
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        // Feed event to egui-winit for input translation
+        {
+            let state = match self.state.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            let win = match state.win.as_mut() {
+                Some(w) => w,
+                None => return,
+            };
+            let response = win.egui_state.on_window_event(&win.window, &event);
+            if response.repaint {
+                win.window.request_redraw();
+            }
+        }
+
+        match event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+            }
+            WindowEvent::Resized(PhysicalSize { width, height }) => {
+                let state = match self.state.as_mut() {
+                    Some(s) => s,
+                    None => return,
+                };
+                if width > 0 && height > 0 {
+                    if let Some(win) = state.win.as_mut() {
+                        win.surface_config.width = width;
+                        win.surface_config.height = height;
+                    }
+                    state.reconfigure_surface();
+                    state.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let state = match self.state.as_mut() {
+                    Some(s) => s,
+                    None => return,
+                };
+                let phys = state.win.as_ref().map(|w| w.window.inner_size());
+                if let Some(phys) = phys {
+                    if phys.width > 0 && phys.height > 0 {
+                        if let Some(win) = state.win.as_mut() {
+                            win.surface_config.width = phys.width;
+                            win.surface_config.height = phys.height;
+                        }
+                        state.reconfigure_surface();
+                    }
+                }
+                state.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                self.render();
+            }
             _ => {}
         }
     }
+}
+
+pub fn run_daemon() {
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .expect("Failed to create event loop");
+    let proxy = event_loop.create_proxy();
+    let mut daemon = Daemon::new(proxy);
+    event_loop.run_app(&mut daemon).expect("Event loop error");
 }
