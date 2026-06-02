@@ -14,6 +14,7 @@ const LOGICAL_HEIGHT: f64 = 480.0;
 #[derive(Debug)]
 enum UserEvent {
     Toggle,
+    Kill,
 }
 
 /// GPU resources that survive hide/show cycles.
@@ -383,8 +384,14 @@ impl ApplicationHandler<UserEvent> for Daemon {
                         use std::io::Read;
                         let _ = stream.read_to_string(&mut buf);
                         for line in buf.lines() {
-                            if line.trim() == "toggle" {
-                                let _ = proxy.send_event(UserEvent::Toggle);
+                            match line.trim() {
+                                "toggle" => {
+                                    let _ = proxy.send_event(UserEvent::Toggle);
+                                }
+                                "kill" => {
+                                    let _ = proxy.send_event(UserEvent::Kill);
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -396,6 +403,10 @@ impl ApplicationHandler<UserEvent> for Daemon {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Toggle => self.toggle(event_loop),
+            UserEvent::Kill => {
+                let _ = std::fs::remove_file(SOCKET_PATH);
+                event_loop.exit();
+            }
         }
     }
 

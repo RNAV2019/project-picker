@@ -15,8 +15,17 @@ const SOCKET_PATH: &str = "/tmp/project-picker.sock";
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let toggle = args.iter().any(|a| a == "--toggle");
+    let kill = args.iter().any(|a| a == "--kill");
 
-    if toggle {
+    if kill {
+        match send_command(b"kill\n") {
+            Ok(()) => return,
+            Err(_) => {
+                eprintln!("project-picker: daemon is not running");
+                std::process::exit(1);
+            }
+        }
+    } else if toggle {
         match send_toggle() {
             Ok(()) => return,
             Err(_) => {
@@ -37,8 +46,12 @@ fn main() {
 }
 
 fn send_toggle() -> std::io::Result<()> {
+    send_command(b"toggle\n")
+}
+
+fn send_command(cmd: &[u8]) -> std::io::Result<()> {
     let mut stream = UnixStream::connect(SOCKET_PATH)?;
-    stream.write_all(b"toggle\n")?;
+    stream.write_all(cmd)?;
     Ok(())
 }
 
