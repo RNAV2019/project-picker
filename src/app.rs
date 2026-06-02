@@ -202,7 +202,7 @@ impl App {
                 let card_rect = full_rect;
                 if card_rect.width() > 0.0 && card_rect.height() > 0.0 {
                     ui.painter().rect_filled(card_rect, rounding, crate::ui::theme::CARD_BG);
-                    ui.painter().rect_stroke(card_rect, rounding, egui::Stroke::new(1.0, crate::ui::theme::BORDER));
+                    ui.painter().rect_stroke(card_rect.shrink(1.0), rounding - 1.0, egui::Stroke::new(1.0, crate::ui::theme::BORDER));
 
                     let builder = egui::UiBuilder::new()
                         .max_rect(card_rect.shrink(1.0))

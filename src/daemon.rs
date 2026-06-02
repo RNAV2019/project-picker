@@ -267,14 +267,12 @@ impl Daemon {
             state.gpu.egui_renderer.free_texture(id);
         }
 
-        // Animation complete: drop WindowState → wl_surface destroyed → compositor unmaps window.
-        // wgpu_surface is dropped before window (field declaration order) so wgpu releases its
-        // Arc<Window> ref first, then our Arc<Window> hits refcount 0 and the window is destroyed.
-        if state.app.anim_hide_pending {
+        // Capture hide flag before rendering — we still render this frame so the compositor
+        // sees the fully-transparent surface before the wl_surface is destroyed.
+        let should_hide = state.app.anim_hide_pending;
+        if should_hide {
             state.app.anim_hide_pending = false;
             state.app.on_hide();
-            state.win = None;
-            return;
         }
 
         let screen_descriptor = {
@@ -340,6 +338,14 @@ impl Daemon {
 
         state.gpu.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+
+        // Drop the window now that the fully-transparent frame has been presented.
+        // wgpu_surface is dropped before window (field declaration order) so wgpu releases its
+        // Arc<Window> ref first, then our Arc<Window> hits refcount 0 and the window is destroyed.
+        if should_hide {
+            state.win = None;
+            return;
+        }
 
         let actions = state.app.drain_actions();
         for action in actions {
